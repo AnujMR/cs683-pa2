@@ -1,0 +1,134 @@
+#include "cache.h"
+#include <cstdlib>
+
+// Dynamic I-RRIP: set-dueling between plain SRRIP and I-RRIP.
+//  - 32 of 1024 sets are LEADERS and always run plain SRRIP. Their demand
+//    traffic measures how instruction-heavy the workload is:
+//        ratio = (instr_acc + instr_miss) / (total_acc + total_miss)
+//  - FOLLOWER sets use I-RRIP when ratio > threshold, else plain SRRIP.
+//  - Every EPOCH leader accesses the mode is re-evaluated and the counters
+//    are halved, so the decision follows phase changes.
+
+#define maxRRPV 3
+#define LEADER_SETS 32
+#define EPOCH 4096
+#define DEFAULT_THRESH 0.25
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];
+
+static uint64_t ld_instr_acc, ld_instr_miss, ld_total_acc, ld_total_miss;
+static uint64_t ld_epoch_count;
+static bool     use_irrip;
+static double   threshold;
+static uint64_t mode_switches, epochs_irrip, epochs_total;
+
+// one leader per constituency of 32 sets, at a different offset in each
+static inline bool is_leader(uint32_t set)
+{
+    return ((set >> 5) == (set & (L2C_SET / LEADER_SETS - 1)));
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    threshold = DEFAULT_THRESH;
+    const char *e = getenv("DYN_IRRIP_THRESH");
+    if (e) threshold = atof(e);
+
+    cout << "Initialize Dynamic I-RRIP state for L2C (threshold = " << threshold
+         << ", leader sets = " << LEADER_SETS << ", epoch = " << EPOCH << ")" << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+        }
+
+    ld_instr_acc = ld_instr_miss = ld_total_acc = ld_total_miss = 0;
+    ld_epoch_count = 0;
+    use_irrip = false;
+    mode_switches = epochs_irrip = epochs_total = 0;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    bool irrip_mode = use_irrip && !is_leader(set);
+
+    while (1) {
+        int instr_candidate = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (!irrip_mode || !l2_is_instr[set][i])
+                    return i;
+                if (instr_candidate < 0)
+                    instr_candidate = i;
+            }
+        }
+        if (instr_candidate >= 0)
+            return instr_candidate;
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+    assert(0);
+    return 0;
+}
+
+static void end_of_epoch()
+{
+    double ratio = 0.0;
+    if (ld_total_acc + ld_total_miss > 0)
+        ratio = (double)(ld_instr_acc + ld_instr_miss) / (double)(ld_total_acc + ld_total_miss);
+
+    bool new_mode = (ratio > threshold);
+    if (new_mode != use_irrip) mode_switches++;
+    use_irrip = new_mode;
+
+    epochs_total++;
+    if (use_irrip) epochs_irrip++;
+
+    ld_instr_acc >>= 1; ld_instr_miss >>= 1;
+    ld_total_acc >>= 1; ld_total_miss >>= 1;
+    ld_epoch_count = 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    bool leader = is_leader(set);
+
+    if (leader && type != WRITEBACK) {          // sample traffic in leader sets
+        ld_total_acc++;
+        if (isInstruction) ld_instr_acc++;
+        if (!hit) {
+            ld_total_miss++;
+            if (isInstruction) ld_instr_miss++;
+        }
+        if (++ld_epoch_count >= EPOCH)
+            end_of_epoch();
+    }
+
+    bool irrip_mode = use_irrip && !leader;
+
+    if (hit) {
+        if (type == WRITEBACK)
+            return;
+        l2_rrpv[set][way] = 0;
+        if (isInstruction) l2_is_instr[set][way] = 1;
+    } else {
+        l2_is_instr[set][way] = isInstruction ? 1 : 0;
+        if (irrip_mode)
+            l2_rrpv[set][way] = isInstruction ? 0 : (maxRRPV - 1);
+        else
+            l2_rrpv[set][way] = maxRRPV - 1;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "Dynamic I-RRIP: epochs=" << epochs_total
+         << " epochs_in_IRRIP_mode=" << epochs_irrip
+         << " mode_switches=" << mode_switches << endl;
+}
