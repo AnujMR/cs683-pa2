@@ -1,16 +1,212 @@
 #include "cache.h"
+#include <iostream>
+#include <unordered_map>
 
+#ifndef LOG2_BLOCK_SIZE
+#define LOG2_BLOCK_SIZE 6
+#endif
+
+#ifndef LOG2_PAGE_SIZE
+#define LOG2_PAGE_SIZE 12
+#endif
+
+// Configuration Parameters
+#define IP_TABLE_SIZE 128
+#define PT_TABLE_SIZE 256
+#define SIG_MASK (PT_TABLE_SIZE - 1)
+#define MAX_UNIFORM_CONF 3
+#define MAX_PT_CONF 3
+#define ACCURACY_INTERVAL 512
+
+// Data Structures
+struct IP_Entry {
+    uint64_t ip_tag;
+    uint64_t last_cl_addr;
+    int64_t last_stride;
+    uint8_t uniform_conf;
+    uint32_t signature;
+    bool valid;
+};
+
+struct PT_Entry {
+    int64_t expected_stride;
+    uint8_t conf;
+};
+
+// Prefetcher Storage Tables
+static IP_Entry ip_table[IP_TABLE_SIZE];
+static PT_Entry pattern_table[PT_TABLE_SIZE];
+
+// Throttling & Accuracy Checker State
+static uint64_t total_prefetches = 0;
+static uint64_t useful_prefetches = 0;
+static uint64_t interval_accesses = 0;
+static uint32_t current_degree = 2; // Dynamic prefetch degree
+
+// Tracks issued prefetches to evaluate accuracy
+static std::unordered_map<uint64_t, bool> prefetched_lines;
 
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
+    std::cout << "         Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+
+    for (int i = 0; i < IP_TABLE_SIZE; i++) {
+        ip_table[i].ip_tag = 0;
+        ip_table[i].last_cl_addr = 0;
+        ip_table[i].last_stride = 0;
+        ip_table[i].uniform_conf = 0;
+        ip_table[i].signature = 0;
+        ip_table[i].valid = false;
+    }
+
+    for (int i = 0; i < PT_TABLE_SIZE; i++) {
+        pattern_table[i].expected_stride = 0;
+        pattern_table[i].conf = 0;
+    }
+
+    total_prefetches = 0;
+    useful_prefetches = 0;
+    interval_accesses = 0;
+    current_degree = 2;
+    prefetched_lines.clear();
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint64_t page_num = addr >> LOG2_PAGE_SIZE;
+
+    // ----------------------------------------------------
+    // 1. Accuracy Checker & Dynamic Throttling
+    // ----------------------------------------------------
+    if (prefetched_lines.find(cl_addr) != prefetched_lines.end()) {
+        useful_prefetches++;
+        prefetched_lines.erase(cl_addr);
+    }
+
+    interval_accesses++;
+    if (interval_accesses >= ACCURACY_INTERVAL) {
+        if (total_prefetches > 0) {
+            double accuracy = (double)useful_prefetches / (double)total_prefetches;
+            if (accuracy > 0.70) {
+                current_degree = 4;
+            } else if (accuracy > 0.45) {
+                current_degree = 3;
+            } else if (accuracy > 0.20) {
+                current_degree = 2;
+            } else {
+                current_degree = 1;
+            }
+        }
+        // Reset counters for next evaluation window
+        total_prefetches = 0;
+        useful_prefetches = 0;
+        interval_accesses = 0;
+        if (prefetched_lines.size() > 2048) {
+            prefetched_lines.clear();
+        }
+    }
+
+    // ----------------------------------------------------
+    // 2. IP Table Lookup & Dual Pattern Classification
+    // ----------------------------------------------------
+    uint32_t ip_index = (ip ^ (ip >> 6)) % IP_TABLE_SIZE;
+    IP_Entry &entry = ip_table[ip_index];
+
+    if (entry.valid && entry.ip_tag == ip) {
+        int64_t current_stride = (int64_t)cl_addr - (int64_t)entry.last_cl_addr;
+
+        if (current_stride != 0) {
+            // Priority 1: Uniform Stride Pattern Detection
+            if (current_stride == entry.last_stride) {
+                if (entry.uniform_conf < MAX_UNIFORM_CONF) {
+                    entry.uniform_conf++;
+                }
+            } else {
+                // Uniform pattern broke -> Fallback/Transition to Non-Uniform
+                if (entry.uniform_conf > 0) {
+                    entry.uniform_conf--;
+                }
+
+                // Train Non-Uniform Pattern Table (Signature -> Stride)
+                uint32_t sig = entry.signature;
+                PT_Entry &pt_entry = pattern_table[sig];
+
+                if (pt_entry.expected_stride == current_stride) {
+                    if (pt_entry.conf < MAX_PT_CONF) {
+                        pt_entry.conf++;
+                    }
+                } else {
+                    if (pt_entry.conf > 0) {
+                        pt_entry.conf--;
+                    } else {
+                        pt_entry.expected_stride = current_stride;
+                        pt_entry.conf = 1;
+                    }
+                }
+
+                // Update Shift-XOR Stride History Signature
+                uint32_t stride_hash = (uint32_t)(current_stride & 0x3F);
+                entry.signature = ((entry.signature << 3) ^ stride_hash) & SIG_MASK;
+            }
+
+            entry.last_stride = current_stride;
+        }
+        entry.last_cl_addr = cl_addr;
+    } else {
+        // Entry Allocation
+        entry.valid = true;
+        entry.ip_tag = ip;
+        entry.last_cl_addr = cl_addr;
+        entry.last_stride = 0;
+        entry.uniform_conf = 0;
+        entry.signature = 0;
+    }
+
+    // ----------------------------------------------------
+    // 3. Issue Prefetches (Degree > 1 & Page Protection)
+    // ----------------------------------------------------
+    uint64_t pf_cl_addr = cl_addr;
+    uint32_t sim_sig = entry.signature;
+
+    for (uint32_t deg = 0; deg < current_degree; deg++) {
+        int64_t stride_to_use = 0;
+
+        // Prioritize Uniform Stride
+        if (entry.uniform_conf >= 2) {
+            stride_to_use = entry.last_stride;
+        }
+        // Fallback to Non-Uniform Stride Sequence
+        else if (pattern_table[sim_sig].conf >= 1) {
+            stride_to_use = pattern_table[sim_sig].expected_stride;
+            // Update lookahead signature for degree > 1
+            uint32_t stride_hash = (uint32_t)(stride_to_use & 0x3F);
+            sim_sig = ((sim_sig << 3) ^ stride_hash) & SIG_MASK;
+        } else {
+            break; // No confident pattern detected
+        }
+
+        if (stride_to_use == 0) {
+            break;
+        }
+
+        pf_cl_addr += stride_to_use;
+        uint64_t pf_addr = pf_cl_addr << LOG2_BLOCK_SIZE;
+
+        // Strict 4KB OS Page Boundary Check
+        if ((pf_addr >> LOG2_PAGE_SIZE) != page_num) {
+            break;
+        }
+
+        // Issue prefetch line to L1 Data Cache
+        prefetch_line(ip, addr, pf_addr, true, 0);
+
+        // Track for accuracy evaluation
+        prefetched_lines[pf_cl_addr] = true;
+        total_prefetches++;
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
