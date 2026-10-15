@@ -1,0 +1,66 @@
+#include "cache.h"
+
+// I-RRIP: instruction-conscious RRIP for the L2C
+//  INSERTION : instruction line -> RRPV 0, data line -> RRPV 2
+//  PROMOTION : any hit -> RRPV 0 (unchanged); writeback hit -> no update
+//  EVICTION  : among max-RRPV lines evict a DATA line first
+
+#define maxRRPV 3
+#define INSTR_INSERT_RRPV 0
+#define DATA_INSERT_RRPV  (maxRRPV - 1)
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP (instruction-conscious RRIP) state for L2C" << endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+        }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    while (1) {
+        int instr_candidate = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (!l2_is_instr[set][i])
+                    return i;                  // prefer a data victim
+                if (instr_candidate < 0)
+                    instr_candidate = i;
+            }
+        }
+        if (instr_candidate >= 0)
+            return instr_candidate;            // only instruction lines at max
+
+        for (int i = 0; i < L2C_WAY; i++)      // age the set
+            l2_rrpv[set][i]++;
+    }
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit) {
+        if (type == WRITEBACK)
+            return;                            // a writeback hit is not a reuse
+        l2_rrpv[set][way] = 0;
+        if (isInstruction)
+            l2_is_instr[set][way] = 1;
+    } else {
+        l2_is_instr[set][way] = isInstruction ? 1 : 0;
+        l2_rrpv[set][way] = isInstruction ? INSTR_INSERT_RRPV : DATA_INSERT_RRPV;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+}
