@@ -64,8 +64,8 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         assert(0);
 
     // uncomment this line to see the L2C accesses
-    // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
-    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+    cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    cout << hex << " paddr: " << setw(12) << full_addr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
     
     if (hit)
         l2_rrpv[set][way] = 0;
